@@ -251,6 +251,9 @@ class TransformerConfig(ModelParallelConfig):
     disable_parameter_transpose_cache: bool = False
     """When set to true, the parameter transposes are not cached for subsequent iterations."""
 
+    memorizing_layer: int = 0
+    """When using retrieve transformer, the memorizing layer should be set."""
+
     # These 2 attributes are WAR for TRTLLM export. DO NOT USE!! WILL BE DEPRECATED SOON!!
     max_position_embeddings: int = 0
     """Deprecated. Do not use."""

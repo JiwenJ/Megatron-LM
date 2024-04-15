@@ -252,6 +252,7 @@ class Attention(MegatronModule, ABC):
         inference_params=None,
         rotary_pos_emb=None,
         packed_seq_params=None,
+        **kwargs
     ):
         # hidden_states: [sq, b, h]
 
@@ -322,6 +323,7 @@ class Attention(MegatronModule, ABC):
                 attention_mask,
                 attn_mask_type=attn_mask_type,
                 packed_seq_params=packed_seq_params,
+                **kwargs
             )
 
         if packed_seq_params is not None:

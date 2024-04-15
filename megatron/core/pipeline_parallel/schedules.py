@@ -161,6 +161,7 @@ def forward_step(
     collect_non_loss_data=False,
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
+    forward_only=False
 ):
 
     """Forward step for passed-in model.
@@ -189,7 +190,7 @@ def forward_step(
         context_manager = contextlib.nullcontext()
     with context_manager:
         if checkpoint_activations_microbatch is None:
-            output_tensor, loss_func = forward_step_func(data_iterator, model)
+            output_tensor, loss_func = forward_step_func(data_iterator, model, forward_only)
         else:
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
@@ -362,6 +363,7 @@ def forward_backward_no_pipelining(
                 forward_data_store,
                 config,
                 collect_non_loss_data,
+                forward_only=forward_only,
                 is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
             )
             if not forward_only:

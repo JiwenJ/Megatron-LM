@@ -42,6 +42,7 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     parser = _add_transformer_engine_args(parser)
     parser = _add_retro_args(parser)
     parser = _add_experimental_args(parser)
+    parser = _add_metee_args(parser)
 
     # Custom arguments.
     if extra_args_provider is not None:
@@ -297,6 +298,7 @@ def validate_args(args, defaults={}):
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+    args.consumed_tokens = 0
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -571,6 +573,12 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['num_query_groups'] = args.num_query_groups
     else:
         kw_args['num_query_groups'] = None
+    if args.retrieve_transformer:
+        if not args.memorizing_layer:
+            kw_args['memorizing_layer'] = args.num_layers // 2
+            print(f"memorzing layer : {kw_args['memorizing_layer']}")
+        else:
+            kw_args['memorizing_layer'] = args.memorizing_layer
 
     # Return config.
     return config_class(**kw_args)
@@ -1611,4 +1619,18 @@ def _add_experimental_args(parser):
     group.add_argument('--yaml-cfg', type=str, default=None,
                        help = 'Config file to add additional arguments')
 
+    return parser
+
+def _add_metee_args(parser):
+    group = parser.add_argument_group(title='metee plugin')
+
+    group.add_argument('--retrieve-transformer', action='store_true',
+                       help='use knn retrieve to support long sequence')
+    group.add_argument('--memorizing-layer', type=int, default=0,
+                       help='set the layer to memorizing layer')
+    group.add_argument('--context-length', type=int, default=None,
+                       help='Maximum context length to process.')
+    group.add_argument('--top-k', type=int, default=None,
+                       help='retrieve the top k K-V pairs for each query')
+    
     return parser

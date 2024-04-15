@@ -14,6 +14,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
+from megatron.metee_plugin.long_context import retrieve_database
+from megatron.training import get_args
 
 
 class DotProductAttention(MegatronModule):
@@ -87,6 +89,11 @@ class DotProductAttention(MegatronModule):
             self.config.attention_dropout if attention_dropout is None else attention_dropout
         )
 
+        self.is_memorizing_layer = False
+        if get_args().retrieve_transformer and layer_number == self.config.memorizing_layer:
+                self.is_memorizing_layer = True
+                self.retrieve_database = retrieve_database()
+
     def forward(
         self,
         query: Tensor,
@@ -95,6 +102,7 @@ class DotProductAttention(MegatronModule):
         attention_mask: Tensor,
         attn_mask_type: AttnMaskType = None,
         packed_seq_params: PackedSeqParams = None,
+        **kwargs
     ):
         assert packed_seq_params is None, (
             "Packed sequence is not supported by DotProductAttention."
@@ -119,87 +127,305 @@ class DotProductAttention(MegatronModule):
                 self.num_attention_heads_per_partition // self.num_query_groups_per_partition, dim=2
             )
 
-        # [b, np, sq, sk]
-        output_size = (
-            query.size(1),
-            query.size(2),
-            query.size(0),
-            key.size(0),
-        )
+        # retrieve history key-value pairs
+        if self.is_memorizing_layer and 'is_last_chunk' in kwargs.keys():
 
-        # [sq, b, np, hn] -> [sq, b * np, hn]
-        # This will be a simple view when doing normal attention, but in group query attention
-        # the key and value tensors are repeated to match the queries so you can't use simple strides
-        # to extract the queries.
-        query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
-        # [sk, b, np, hn] -> [sk, b * np, hn]
-        key = key.view(output_size[3], output_size[0] * output_size[1], -1)
+            # use forward_only as an identifier of evaluation
+            if 'forward_only' in kwargs.keys() and kwargs['forward_only']==True:
+                self.retrieve_database.set_eval_mode()
+            else:
+                self.retrieve_database.set_train_mode()
 
-        # preallocting input tensor: [b * np, sq, sk]
-        matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
-            (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
-        )
+            if len(self.retrieve_database): # is first chunk or not
+                key_ret, val_ret = self.retrieve_database.get(query, kwargs['top_k'])
+                key_ret = torch.from_numpy(key_ret).to(device=key.device, dtype=key.dtype)
+                val_ret = torch.from_numpy(val_ret).to(device=value.device, dtype=value.dtype)
+                first_chunk = False
+            else:
+                first_chunk = True
 
-        # Raw attention scores. [b * np, sq, sk]
-        matmul_result = torch.baddbmm(
-            matmul_input_buffer,
-            query.transpose(0, 1),  # [b * np, sq, hn]
-            key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
-            beta=0.0,
-            alpha=(1.0 / self.norm_factor),
-        )
+            if kwargs['is_last_chunk']:
+                self.retrieve_database.clear()
+            else:
+                self.retrieve_database.add(key, value)
 
-        # change view to [b, np, sq, sk]
-        attention_scores = matmul_result.view(*output_size)
+        if self.is_memorizing_layer and 'is_last_chunk' in kwargs.keys():
+            if first_chunk:
+                # [b, np, sq, sk]
+                output_size = (
+                    query.size(1),
+                    query.size(2),
+                    query.size(0),
+                    key.size(0),
+                )
 
-        # ===========================
-        # Attention probs and dropout
-        # ===========================
+                # [sq, b, np, hn] -> [sq, b * np, hn]
+                # This will be a simple view when doing normal attention, but in group query attention
+                # the key and value tensors are repeated to match the queries so you can't use simple strides
+                # to extract the queries.
+                query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
+                # [sk, b, np, hn] -> [sk, b * np, hn]
+                key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # attention scores and attention mask [b, np, sq, sk]
-        attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
+                # preallocting input tensor: [b * np, sq, sk]
+                matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                    (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+                )
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
+                # Raw attention scores. [b * np, sq, sk]
+                matmul_result = torch.baddbmm(
+                    matmul_input_buffer,
+                    query.transpose(0, 1),  # [b * np, sq, hn]
+                    key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                    beta=0.0,
+                    alpha=(1.0 / self.norm_factor),
+                )
 
-        if not self.config.sequence_parallel:
-            with tensor_parallel.get_cuda_rng_tracker().fork():
-                attention_probs = self.attention_dropout(attention_probs)
+                # change view to [b, np, sq, sk]
+                attention_scores = matmul_result.view(*output_size)
+
+                # ===========================
+                # Attention probs and dropout
+                # ===========================
+
+                # attention scores and attention mask [b, np, sq, (top_k+1)*sk]
+                # attention_mask = torch.cat()
+                attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
+
+                # This is actually dropping out entire tokens to attend to, which might
+                # seem a bit unusual, but is taken from the original Transformer paper.
+
+                if not self.config.sequence_parallel:
+                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                        attention_probs = self.attention_dropout(attention_probs)
+                else:
+                    attention_probs = self.attention_dropout(attention_probs)
+
+                # =========================
+                # Context layer. [sq, b, hp]
+                # =========================
+
+                # value -> context layer.
+                # [sk, b, np, hn] --> [b, np, sq, hn]
+
+                # context layer shape: [b, np, sq, hn]
+                output_size = (
+                    value.size(1),
+                    value.size(2),
+                    query.size(0),
+                    value.size(3),
+                )
+
+                # change view [sk, b * np, hn]
+                value = value.view(value.size(0), output_size[0] * output_size[1], -1)
+
+                # change view [b * np, sq, (top_k+1)sk]
+                attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+                # matmul: [b * np, sq, hn]
+                context = torch.bmm(attention_probs, value.transpose(0, 1))
+
+                # change view [b, np, sq, hn]
+                context = context.view(*output_size)
+
+                # [b, np, sq, hn] --> [sq, b, np, hn]
+                context = context.permute(2, 0, 1, 3).contiguous()
+
+                # [sq, b, np, hn] --> [sq, b, hp]
+                new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+                context = context.view(*new_context_shape)
+
+                return context
+
+            else:
+	        # for attention_retrieve, launch twice kernel
+                output_size = (
+                    query.size(1),
+                    query.size(2),
+                    query.size(0),
+                    key.size(0),
+                )
+                query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
+                key = key.view(output_size[3], output_size[0] * output_size[1], -1)
+                matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                    (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+                )
+                matmul_result = torch.baddbmm(
+                    matmul_input_buffer,
+                    query.transpose(0, 1),
+                    key.transpose(0, 1).transpose(1, 2),
+                    beta=0.0,
+                    alpha=(1.0 / self.norm_factor),
+                )
+                attention_scores = matmul_result.view(*output_size)
+
+                output_size = output_size[:3]+(key_ret.size(0),)
+                key_ret = key_ret.view(output_size[3], output_size[0] * output_size[1], -1)
+                matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                    (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+                )
+                matmul_result = torch.baddbmm(
+                    matmul_input_buffer,
+                    query.transpose(0, 1),
+                    key_ret.transpose(0, 1).transpose(1, 2),
+                    beta=0.0,
+                    alpha=(1.0 / self.norm_factor),
+                )
+                del key_ret
+                attention_scores_ret = matmul_result.view(*output_size)
+                #attention_scores = torch.cat((attention_scores, attention_scores_ret), dim=-1)
+                #del attention_scores_ret
+
+                attention_mask_ret = torch.ones((attention_mask.shape[0], attention_mask.shape[1], attention_mask.shape[2], kwargs['top_k']*attention_mask.shape[3])) < 0.5
+                attention_mask_ret = attention_mask_ret.to(device=attention_mask.device)
+                ## attention scores and attention mask [b, np, sq, (1+top_k)*sk]
+                #attention_mask = torch.cat((attention_mask, attention_mask_ret), dim=3)
+                #del attention_mask_ret
+                attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
+                attention_probs_ret: Tensor = self.scale_mask_softmax(attention_scores_ret, attention_mask_ret)
+
+                # This is actually dropping out entire tokens to attend to, which might
+                # seem a bit unusual, but is taken from the original Transformer paper.
+
+                if not self.config.sequence_parallel:
+                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                        attention_probs = self.attention_dropout(attention_probs)
+                        attention_probs_ret = self.attention_dropout(attention_probs_ret)
+                else:
+                    attention_probs = self.attention_dropout(attention_probs)
+                    attention_probs_ret = self.attention_dropout(attention_probs_ret)
+
+                # =========================
+                # Context layer. [sq, b, hp]
+                # =========================
+
+                # value -> context layer.
+                # [sk, b, np, hn] --> [b, np, sq, hn]
+
+                # context layer shape: [b, np, sq, hn]
+                output_size = (
+                    value.size(1),
+                    value.size(2),
+                    query.size(0),
+                    value.size(3),
+                )
+
+                # change view [sk, b * np, hn]
+                value = value.view(value.size(0), output_size[0] * output_size[1], -1)
+                # change view [top_k*sk, b * np, hn]
+                val_ret = val_ret.view(val_ret.size(0), output_size[0] * output_size[1], -1)
+                #value = torch.cat((value, val_ret), dim=0)
+                #del val_ret
+
+                # change view [b * np, sq, (top_k+1)sk]
+                attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+                attention_probs_ret = attention_probs_ret.view(output_size[0] * output_size[1], output_size[2], -1)
+
+                # matmul: [b * np, sq, hn]
+                context = torch.bmm(attention_probs, value.transpose(0, 1))
+                context_ret = torch.bmm(attention_probs_ret, val_ret.transpose(0, 1))
+                del val_ret
+
+                # change view [b, np, sq, hn]
+                context = context.view(*output_size)
+                context_ret = context_ret.view(*output_size)
+
+                # [b, np, sq, hn] --> [sq, b, np, hn]
+                context = context.permute(2, 0, 1, 3).contiguous()
+                context_ret = context_ret.permute(2, 0, 1, 3).contiguous()
+
+                belta = torch.rand(context.shape[2], dtype=context.dtype, device=context.device, requires_grad=True)
+                belta = belta.view(1, 1, context.shape[2], 1)
+                context = torch.sigmoid(belta)*context_ret + (1-torch.sigmoid(belta))*context
+                del context_ret
+
+                # [sq, b, np, hn] --> [sq, b, hp]
+                new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+                context = context.view(*new_context_shape)
+
+                return context
         else:
-            attention_probs = self.attention_dropout(attention_probs)
+            # [b, np, sq, sk]
+            output_size = (
+                query.size(1),
+                query.size(2),
+                query.size(0),
+                key.size(0),
+            )
 
-        # =========================
-        # Context layer. [sq, b, hp]
-        # =========================
+            # [sq, b, np, hn] -> [sq, b * np, hn]
+            # This will be a simple view when doing normal attention, but in group query attention
+            # the key and value tensors are repeated to match the queries so you can't use simple strides
+            # to extract the queries.
+            query = query.reshape(output_size[2], output_size[0] * output_size[1], -1)
+            # [sk, b, np, hn] -> [sk, b * np, hn]
+            key = key.view(output_size[3], output_size[0] * output_size[1], -1)
 
-        # value -> context layer.
-        # [sk, b, np, hn] --> [b, np, sq, hn]
+            # preallocting input tensor: [b * np, sq, sk]
+            matmul_input_buffer = parallel_state.get_global_memory_buffer().get_tensor(
+                (output_size[0] * output_size[1], output_size[2], output_size[3]), query.dtype, "mpu",
+            )
 
-        # context layer shape: [b, np, sq, hn]
-        output_size = (
-            value.size(1),
-            value.size(2),
-            query.size(0),
-            value.size(3),
-        )
+            # Raw attention scores. [b * np, sq, sk]
+            matmul_result = torch.baddbmm(
+                matmul_input_buffer,
+                query.transpose(0, 1),  # [b * np, sq, hn]
+                key.transpose(0, 1).transpose(1, 2),  # [b * np, hn, sk]
+                beta=0.0,
+                alpha=(1.0 / self.norm_factor),
+            )
 
-        # change view [sk, b * np, hn]
-        value = value.view(value.size(0), output_size[0] * output_size[1], -1)
+            # change view to [b, np, sq, sk]
+            attention_scores = matmul_result.view(*output_size)
 
-        # change view [b * np, sq, sk]
-        attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+            # ===========================
+            # Attention probs and dropout
+            # ===========================
 
-        # matmul: [b * np, sq, hn]
-        context = torch.bmm(attention_probs, value.transpose(0, 1))
+            # attention scores and attention mask [b, np, sq, sk]
+            attention_probs: Tensor = self.scale_mask_softmax(attention_scores, attention_mask)
 
-        # change view [b, np, sq, hn]
-        context = context.view(*output_size)
+            # This is actually dropping out entire tokens to attend to, which might
+            # seem a bit unusual, but is taken from the original Transformer paper.
 
-        # [b, np, sq, hn] --> [sq, b, np, hn]
-        context = context.permute(2, 0, 1, 3).contiguous()
+            if not self.config.sequence_parallel:
+                with tensor_parallel.get_cuda_rng_tracker().fork():
+                    attention_probs = self.attention_dropout(attention_probs)
+            else:
+                attention_probs = self.attention_dropout(attention_probs)
 
-        # [sq, b, np, hn] --> [sq, b, hp]
-        new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
-        context = context.view(*new_context_shape)
+            # =========================
+            # Context layer. [sq, b, hp]
+            # =========================
 
-        return context
+            # value -> context layer.
+            # [sk, b, np, hn] --> [b, np, sq, hn]
+
+            # context layer shape: [b, np, sq, hn]
+            output_size = (
+                value.size(1),
+                value.size(2),
+                query.size(0),
+                value.size(3),
+            )
+
+            # change view [sk, b * np, hn]
+            value = value.view(value.size(0), output_size[0] * output_size[1], -1)
+
+            # change view [b * np, sq, sk]
+            attention_probs = attention_probs.view(output_size[0] * output_size[1], output_size[2], -1)
+
+            # matmul: [b * np, sq, hn]
+            context = torch.bmm(attention_probs, value.transpose(0, 1))
+
+            # change view [b, np, sq, hn]
+            context = context.view(*output_size)
+
+            # [b, np, sq, hn] --> [sq, b, np, hn]
+            context = context.permute(2, 0, 1, 3).contiguous()
+
+            # [sq, b, np, hn] --> [sq, b, hp]
+            new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+            context = context.view(*new_context_shape)
+
+            return context

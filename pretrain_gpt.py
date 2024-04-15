@@ -29,6 +29,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
+from megatron.metee_plugin.long_context import context_dataloader
 
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
@@ -137,7 +138,7 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     return loss * args.context_parallel_size, {'lm loss': averaged_loss[0]}
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: GPTModel, forward_only: bool):
     """Forward training step.
 
     Args:
@@ -149,12 +150,19 @@ def forward_step(data_iterator, model: GPTModel):
 
     # Get the batch.
     timers('batch-generator', log_level=2).start()
-    tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
-        data_iterator)
+    if args.retrieve_transformer:
+        (tokens, labels, loss_mask, attention_mask, position_ids), is_last_chunk = context_dataloader(data_iterator=data_iterator).get_batch_on_this_tp_rank()
+    else:
+        tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+            data_iterator) 
     timers('batch-generator').stop()
 
-    output_tensor = model(tokens, position_ids, attention_mask,
-                          labels=labels)
+    if args.retrieve_transformer:
+        output_tensor = model(tokens, position_ids, attention_mask, 
+                            labels=labels, extra_block_kwargs={'top_k':args.top_k, 'is_last_chunk':is_last_chunk, 'forward_only':forward_only})
+    else:
+        output_tensor = model(tokens, position_ids, attention_mask,
+                            labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 

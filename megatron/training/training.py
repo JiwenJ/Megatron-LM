@@ -11,7 +11,7 @@ import os
 import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
-logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
+logging.basicConfig(handlers=[CustomHandler()], level=logging.WARNING)
 from .theoretical_memory_usage import report_theoretical_memory
 import time
 # The earliest we can measure the start time.
@@ -708,6 +708,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
             writer.add_scalar(key , loss_dict[key], iteration)
             writer.add_scalar(key + ' vs samples', loss_dict[key],
                               args.consumed_train_samples)
+            writer.add_scalar(key + ' vs tokens', loss_dict[key],
+                              args.consumed_tokens)
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
         if args.log_loss_scale_to_tensorboard:
@@ -777,6 +779,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(
             iteration, args.train_iters)
+        log_string += ' consumed tokens: {:2e} |'.format(
+            args.consumed_tokens)
         log_string += ' consumed samples: {:12d} |'.format(
             args.consumed_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
@@ -1007,7 +1011,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
                      get_num_microbatches()
-        args.consumed_train_samples += batch_size
+        if args.retrieve_transformer:
+            args.consumed_train_samples = args.consumed_train_samples+batch_size if iteration%(args.seq_length/args.context_length)==0 else args.consumed_train_samples
+            args.consumed_tokens = iteration*batch_size*args.context_length
+        else:
+            args.consumed_train_samples += batch_size
+            args.consumed_tokens = args.consumed_train_samples*args.seq_length
         num_floating_point_operations_so_far += num_floating_point_operations(args, batch_size)
 
         # Logging.
@@ -1175,11 +1184,14 @@ def evaluate(forward_step_func,
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {args.eval_iters * eval_batch_size} samples')
-        while iteration < args.eval_iters:
+        if args.retrieve_transformer:
+            eval_iters = int(args.eval_iters * (args.seq_length / args.context_length))
+        else:
+            eval_iters = args.eval_iters
+        while iteration < eval_iters:
             iteration += 1
             if verbose:
-                print_rank_0(f'Evaluating iter {iteration}/{args.eval_iters}')
-
+                print_rank_0(f'Evaluating iter {iteration}/{eval_iters}')
             forward_backward_func = get_forward_backward_func()
             # Don't care about timing during evaluation
             config.timers = None
@@ -1237,7 +1249,7 @@ def evaluate(forward_step_func,
         model_module.train()
 
     for key in total_loss_dict:
-        total_loss_dict[key] /= args.eval_iters * eval_num_microbatches
+        total_loss_dict[key] /= eval_iters * eval_num_microbatches
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
