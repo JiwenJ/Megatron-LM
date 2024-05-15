@@ -2,3 +2,4 @@
 
 
 from .tokenizer import build_tokenizer
+from .tokenizer import _Llama3Tokenizer

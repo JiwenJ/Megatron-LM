@@ -1,0 +1,1 @@
+TOKENIZER_PATH=/data/jjw/thlm/Meta-Llama-3-8B/tokenizer.model python -m unittest test_tokenizer.py
