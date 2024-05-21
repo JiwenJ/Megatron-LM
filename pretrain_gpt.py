@@ -29,7 +29,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-
+os.environ["WANDB_API_KEY"]="18e5bdd1eba9fd3c06fd5fcf7b00643c92a10d4f"
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -152,6 +152,7 @@ def forward_step(data_iterator, model: GPTModel):
     tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
         data_iterator)
     timers('batch-generator').stop()
+    # breakpoint()
 
     output_tensor = model(tokens, position_ids, attention_mask,
                           labels=labels)

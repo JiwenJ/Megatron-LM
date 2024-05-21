@@ -163,7 +163,7 @@ def sinkhorn(cost, tol=0.0001):
     cost = torch.exp(cost)
     d0 = torch.ones(cost.size(0), device=cost.device, dtype=cost.dtype)
     d1 = torch.ones(cost.size(1), device=cost.device, dtype=cost.dtype)
-    
+
     eps = 0.00000001
     error = 1e9
     d1_old = d1
@@ -231,7 +231,7 @@ class SwitchMLP(MegatronModule):
         b = hidden_states.size(1)
         h = hidden_states.size(2)
         route = self.router(hidden_states).view(-1, args.num_experts)
-        
+
         # TODO (rprenger) Right now we're just using the sinkhorn algorithm
         # for load balancing. There should be an option to do no load balancing
         # and the algorithm and parametets should be further tested
@@ -694,7 +694,7 @@ class ParallelAttention(MegatronModule):
                 dim=3)
 
             # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn] -
-            query_layer = query_layer.view(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
+            query_layer = query_layer.reshape(query_layer.size(0), query_layer.size(1), -1, self.hidden_size_per_attention_head)
         else:
             # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
             mixed_kv_layer, _ = self.key_value(encoder_output)

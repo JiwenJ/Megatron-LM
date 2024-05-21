@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Pretrain utilities."""
-
+from loguru import logger
+import gpustat
 import gc
 import dataclasses
 from datetime import datetime
@@ -196,9 +197,10 @@ def pretrain(train_valid_test_dataset_provider,
     """
 
     # Initalize and get arguments, timers, and Tensorboard writer.
+    # logger.info("Before")
     initialize_megatron(extra_args_provider=extra_args_provider,
                         args_defaults=args_defaults)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     args = get_args()
     timers = get_timers()
 
@@ -206,7 +208,7 @@ def pretrain(train_valid_test_dataset_provider,
         append_to_progress_log("Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
+    # set_jit_fusion_options()
 
     # Adjust the startup time so it reflects the largest value.
     # This will be closer to what scheduler will see (outside of
@@ -235,7 +237,7 @@ def pretrain(train_valid_test_dataset_provider,
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_provider, model_type)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate '
                    'scheduler are built')
@@ -261,7 +263,7 @@ def pretrain(train_valid_test_dataset_provider,
                 train_valid_test_dataset_provider)
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     # Print setup timing.
     print_rank_0('done with setup ...')
     timers.log(['model-and-optimizer-setup',
@@ -389,7 +391,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                 post_process=post_process
             )
         model.model_type = model_type
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     if not isinstance(model, list):
         model = [model]
 
@@ -400,7 +402,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     for model_module in model:
         for param in model_module.parameters():
             tensor_parallel.set_defaults_if_not_set_tensor_model_parallel_attributes(param)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     # Print number of parameters.
     if mpu.get_data_parallel_rank() == 0:
         print(' > number of parameters on (tensor, pipeline) '
@@ -409,15 +411,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             mpu.get_pipeline_model_parallel_rank(),
             sum([sum([p.nelement() for p in model_module.parameters()])
                  for model_module in model])), flush=True)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     # GPU allocation.
     for model_module in model:
         model_module.cuda(torch.cuda.current_device())
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     if wrap_with_ddp:
         config = get_model_config(model[0])
         model = [DDP(config,
@@ -432,11 +434,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
                      disable_bucketing=(model_chunk_idx > 0),
                      check_for_nan_in_grad=args.check_for_nan_in_loss_and_grad)
                  for (model_chunk_idx, model_chunk) in enumerate(model)]
-
+        torch.cuda.empty_cache()
+        # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
         # Broadcast params from data parallel src rank to other data parallel ranks.
         if args.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
+        # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
 
     return model
 
@@ -499,10 +503,11 @@ def setup_model_and_optimizer(model_provider_func,
     """Setup model and optimizer."""
     args = get_args()
     timers = get_timers()
-
+ 
     model = get_model(model_provider_func, model_type)
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     unwrapped_model = unwrap_model(model)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):
         if hasattr(args, f.name):
@@ -511,8 +516,9 @@ def setup_model_and_optimizer(model_provider_func,
     config.timers = timers
     optimizer = get_megatron_optimizer(config, model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
-
+    # logger.info(f"After {gpustat.GPUStatCollection.new_query()[6].memory_used}")
     if args.load is not None or args.pretrained_checkpoint is not None:
         timers('load-checkpoint', log_level=0).start(barrier=True)
         args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
@@ -530,7 +536,7 @@ def setup_model_and_optimizer(model_provider_func,
         unwrapped_model[0].init_state_dict_from_bert()
         if args.fp16:
             optimizer.reload_model_params()
-
+    # breakpoint()
     return model, optimizer, opt_param_scheduler
 
 
@@ -610,6 +616,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
+    # breakpoint()
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -688,6 +695,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
                      normalizer=total_iterations)
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:
+            # breakpoint()/
             wandb_writer.log({'samples vs steps': args.consumed_train_samples},
                              iteration)
         if args.log_learning_rate_to_tensorboard:
@@ -975,6 +983,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             })
 
     while iteration < args.train_iters:
+        # breakpoint()
         if args.profile and \
            iteration == args.profile_step_start and \
            torch.distributed.get_rank() in args.profile_ranks:
@@ -996,6 +1005,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
         args.curr_iteration = iteration
+        # breakpoint()
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
@@ -1004,6 +1014,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                        opt_param_scheduler,
                        config)
         iteration += 1
+        # breakpoint()
         batch_size = mpu.get_data_parallel_world_size() * \
                      args.micro_batch_size * \
                      get_num_microbatches()
@@ -1021,11 +1032,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
         learning_rate = None
         decoupled_learning_rate = None
+        # breakpoint()
         for param_group in optimizer.param_groups:
             if param_group['is_decoupled_lr']:
                 decoupled_learning_rate = param_group['lr']
             else:
                 learning_rate = param_group['lr']
+        # breakpoint()
         report_memory_flag = training_log(loss_dict, total_loss_dict,
                                           learning_rate,
                                           decoupled_learning_rate,

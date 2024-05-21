@@ -177,6 +177,7 @@ def _set_wandb_writer(args):
             'project': args.wandb_project,
             'config': vars(args)}
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
+        # breakpoint()
         wandb.init(**wandb_kwargs)
         _GLOBAL_WANDB_WRITER = wandb
 

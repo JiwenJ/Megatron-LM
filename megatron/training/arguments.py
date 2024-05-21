@@ -62,7 +62,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
 
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
-    args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    args.world_size = int(os.getenv("WORLD_SIZE", '4'))
+
+    # print("--------===============-----------")
+    # print(args.world_size)
 
     return args
 
@@ -146,6 +149,9 @@ def validate_args(args, defaults={}):
 
     # Load saved args from Retro (if applicable).
     load_retro_args(args)
+    # if args.rank == 0:
+    #     print("-------------------------")
+    #     print(args.world_size)
 
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
@@ -599,7 +605,7 @@ def _add_transformer_engine_args(parser):
     group.add_argument('--no-fp8-wgrad', action='store_false',
                        help='Execute wgrad in higher precision even for FP8 runs',
                        dest='fp8_wgrad')
-    group.add_argument('--transformer-impl', default='transformer_engine',
+    group.add_argument('--transformer-impl', default='local',
                        choices=['local', 'transformer_engine'],
                        help='Which Transformer implementation to use.')
 
@@ -961,7 +967,7 @@ def _add_training_args(parser):
                        ' overlap of Tensor parallel communication and GEMM kernels.')
     group.add_argument('--tp-comm-overlap-cfg', type=str, default=None,
                        help='Config file when tp_comm_overlap is enabled.')
-    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false', 
+    group.add_argument('--disable-tp-comm-overlap-ag', action='store_false',
                        help=('Disables the All-Gather overlap with GEMM by '
                              'pipelining the GEMM and All-Gather.'),
                        dest='tp_comm_overlap_ag')
@@ -1344,7 +1350,7 @@ def _add_data_args(parser):
                        'single dataset used for all three: train, valid '
                        'and test. It is exclusive to the other '
                        '--*-data-path args')
-    group.add_argument('--split', type=str, default='969, 30, 1',
+    group.add_argument('--split', type=str, default='90, 5, 5',
                        help='Comma-separated list of proportions for training,'
                        ' validation, and test split. For example the split '
                        '`90,5,5` will use 90%% of data for training, 5%% for '
@@ -1409,6 +1415,7 @@ def _add_data_args(parser):
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
                                 'Llama2Tokenizer',
+                                'Llama3Tokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
